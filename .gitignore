@@ -1,0 +1,13 @@
+# python environment
+/.conda
+
+# misc directories
+/checkpoints
+/wandb
+/testing
+
+# logs
+slurm*.out
+
+# cluster job files
+*.sbatch
