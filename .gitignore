@@ -1,12 +1,16 @@
 # python environment
 /.conda
 
-# misc directories
+# data folders
+/data/pretrain
+/data/finetune
+/data/tokenizers
+
+# training folders
 /checkpoints
 /wandb
-/testing
 
-# logs
+# cluster logs
 slurm*.out
 
 # cluster job files

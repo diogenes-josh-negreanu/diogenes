@@ -5,6 +5,7 @@ import torch
 import math
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 # dynamically select device
 if torch.cuda.is_available():
@@ -25,8 +26,8 @@ class RoPE(nn.Module):
 	RoPE.__init__
 		Initializes encoding with proper embedding dimension.
 
-	Args:
-		embed_dim: int embedding dimensionality
+		Args:
+			embed_dim: int embedding dimensionality
 	"""
 	def __init__(self, embed_dim):
 		super().__init__()
@@ -36,19 +37,18 @@ class RoPE(nn.Module):
 	RoPE.forward
 		Applies rotary positional encoding to input.
 	
-	Args:
-		x: torch.Tensor of size (B, N, D)
+		Args:
+			x: torch.Tensor of size (B, N, D)
 
-	Returns:
-		torch.Tensor of size (B, N, D)
+		Returns:
+			torch.Tensor of size (B, N, D)
 	"""
 	def forward(self, x):
-		batch_size = x.shape[0]
 		seq_len = x.shape[1]
 
-		theta = 1.0 / (10000 ** (torch.arange(0, self.embed_dim, 2).float() / self.embed_dim)).to(device)
+		theta = 1.0 / (10000 ** (torch.arange(0, self.embed_dim, 2).float() / self.embed_dim)).to(x.device)
 
-		seq_idx = torch.arange(seq_len).float()
+		seq_idx = torch.arange(seq_len).float().to(x.device)
 
 		idx_theta = torch.einsum("i,j->ij", seq_idx, theta)
 		hat_theta = torch.cat([idx_theta, idx_theta], axis=-1)
@@ -80,11 +80,11 @@ class SinusoidalEncoding(nn.Module):
 	SinusoidalEncoding.forward
 		Applies sinusoidal positional encoding to input.
 	
-	Args:
-		x: torch.Tensor of size (B, N, D)
+		Args:
+			x: torch.Tensor of size (B, N, D)
 
-	Returns:
-		torch.Tensor of size (B, N, D)
+		Returns:
+			torch.Tensor of size (B, N, D)
 	"""
 	def forward(self, x):
 		batch_size = x.shape[0]
@@ -117,9 +117,9 @@ class MultiheadAttention(nn.Module):
 		Constructs key, query, and value matrices, and
 		final linear layer.
 	
-	Args:
-		emb_dim: int size of embedding dimension
-		num_heads: int number of attention heads
+		Args:
+			emb_dim: int size of embedding dimension
+			num_heads: int number of attention heads
 	"""
 	def __init__(self, emb_dim, num_heads):
 		super().__init__()
@@ -128,13 +128,21 @@ class MultiheadAttention(nn.Module):
 		self.emb_dim = emb_dim
 		self.head_dim = int(emb_dim / num_heads)
 		self.num_heads = num_heads
-		
+
 		# set up key, query, and value linear transformations
 		self.q_linear = nn.Linear(emb_dim, emb_dim)
 		self.k_linear = nn.Linear(emb_dim, emb_dim)
 		self.v_linear = nn.Linear(emb_dim, emb_dim)
 
 		self.concat_linear = nn.Linear(emb_dim, emb_dim)
+
+		self.cache_k = None
+		self.cache_v = None
+
+
+	def reset_cache(self):
+		self.cache_k = None
+		self.cache_v = None
 
 
 	"""
@@ -143,32 +151,30 @@ class MultiheadAttention(nn.Module):
 		previously passed through key, query, and value
 		transformations.
 	
-	Args:
-		q: torch.Tensor input queries
-		k: torch.Tensor input keys
-		v: torch.Tensor input values
-		is_causal: boolean causal masking flag
-	
-	Returns:
-		torch.Tensor of size (B, N, D)
+		Args:
+			q: torch.Tensor input queries
+			k: torch.Tensor input keys
+			v: torch.Tensor input values
+			is_causal: boolean causal masking flag
+		
+		Returns:
+			torch.Tensor of size (B, N, D)
 	"""
 	def scaled_dot_product_attention(self, q, k, v, is_causal):
-		seq_len = q.shape[1]
+		q_len = q.shape[1]
+		k_len = k.shape[1]
 
-		# dot product self attention
+		# F.scaled_dot_product_attention expects (B, H, N, head_dim)
 		q = q.transpose(1, 2)
 		k = k.transpose(1, 2)
 		v = v.transpose(1, 2)
-		dots = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
-		# apply causal mask if causal
-		if is_causal:
-			mask = (torch.triu(torch.ones(seq_len, seq_len)) == 1).transpose(0, 1)
-			causal_mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0)).to(device)
-			dots = dots + causal_mask
-		
-		attn = F.softmax(dots, dim=-1)
-		return torch.matmul(attn, v).transpose(1, 2).contiguous()
+		# When using KV cache q_len < k_len; F.sdpa's is_causal flag assumes a
+		# square (q_len == k_len) mask, so disable it for cached inference
+		# (a single new token can attend to all cached keys without masking).
+		effective_causal = is_causal and (q_len == k_len)
+		attn = F.scaled_dot_product_attention(q, k, v, is_causal=effective_causal)
+		return attn.transpose(1, 2).contiguous()
 
 	
 	"""
@@ -179,20 +185,28 @@ class MultiheadAttention(nn.Module):
 		applies scaled dot product attention, concatenates
 		and passes through a final linear layer.
 	
-	Args:
-		x: torch.Tensor of size (B, N, D)
-		is_causal: boolean causal masking flag
-	
-	Returns:
-		torch.Tensor of size (B, N, D)
+		Args:
+			x: torch.Tensor of size (B, N, D)
+			is_causal: boolean causal masking flag
+		
+		Returns:
+			torch.Tensor of size (B, N, D)
 	"""
-	def forward(self, x, is_causal):
+	def forward(self, x, is_causal, use_cache=False):
 		bs = x.shape[0]
 
 		# run through query, key, and value transformations
 		q = self.q_linear(x).view(bs, -1, self.num_heads, self.head_dim)
 		k = self.k_linear(x).view(bs, -1, self.num_heads, self.head_dim)
 		v = self.v_linear(x).view(bs, -1, self.num_heads, self.head_dim)
+
+		# append new k/v to the cache, then attend over the full cached sequence
+		if use_cache:
+			if self.cache_k is not None:
+				k = torch.cat([self.cache_k, k], dim=1)
+				v = torch.cat([self.cache_v, v], dim=1)
+			self.cache_k = k
+			self.cache_v = v
 
 		# calculate attentions, concatenate multiple heads
 		attn = self.scaled_dot_product_attention(q, k, v, is_causal)
@@ -212,22 +226,32 @@ class TransformerLayer(nn.Module):
 		layer, feed forward layer, and batch
 		normalization.
 	
-	Args:
-		emb_dim: int embedding dimension
-		num_head: int number of heads
+		Args:
+			emb_dim: int embedding dimension
+			num_head: int number of heads
 	"""
 	def __init__(self, emb_dim, num_heads):
 		super().__init__()
-		# self.attn_layer = nn.MultiheadAttention(emb_dim, num_heads, batch_first=True)
+		# attention layer
 		self.attn_layer = MultiheadAttention(emb_dim, num_heads)
 
+		# neural network
 		self.feed_forward = nn.Sequential(
-			nn.Linear(emb_dim, 1024),
+			nn.Linear(emb_dim, 3072),
 			nn.ReLU(),
-			nn.Linear(1024, emb_dim)
+			nn.Linear(3072, emb_dim)
 		)
 
+		# layer norms
 		self.layer_norm = nn.LayerNorm(emb_dim)
+		self.layer_norm2 = nn.LayerNorm(emb_dim)
+
+		# attention residuals
+		self.attn_res = AttentionResidual(emb_dim)
+	
+
+	def reset_cache(self):
+		self.attn_layer.reset_cache()
 	
 
 	"""
@@ -237,23 +261,30 @@ class TransformerLayer(nn.Module):
 		batch norm, feedfoward (with resudial),
 		and batch norm.
 	
-	Args:
-		x: torch.Tensor of size (B, N, D)
-		is_causal: boolean causal masking flag
-	
-	Returns:
-		torch.Tensor of size (B, N, D)
+		Args:
+			x: torch.Tensor of size (B, N, D)
+			is_causal: boolean causal masking flag
+		
+		Returns:
+			torch.Tensor of size (B, N, D)
 	"""
-	def forward(self, x, is_causal):
-		# run through residual attention layer (with causal mask if specified)
-		# mask = torch.triu(torch.ones(x.shape[1], x.shape[1]), diagonal=1).bool().to(device)
-		# x = x + self.attn_layer(x, x, x, is_causal=is_causal, attn_mask=mask)[0]
-		x = x + self.attn_layer(x, is_causal)
+	def forward(self, layer_outputs, is_causal=True, use_cache=False):
+		# h is the attention-residual aggregated input for this layer (h_l)
+		# Checkpoint attn_res to avoid saving the O(L^2) stacked v/k tensors;
+		# they're cheap to recompute and dominate activation memory.
+		if self.training:
+			h = checkpoint(self.attn_res, *layer_outputs, use_reentrant=False)
+		else:
+			h = self.attn_res(*layer_outputs)
+
+		# run through attention layer
+		x = h + self.attn_layer(h, is_causal, use_cache)
 		x = self.layer_norm(x)
 
 		# run through feed forward network
 		x = x + self.feed_forward(x)
-		return self.layer_norm(x)
+		x = self.layer_norm2(x)
+		return x
 
 
 """
@@ -267,10 +298,10 @@ class Transformer(nn.Module):
 		Configures interal list of
 		transformer layers.
 	
-	Args:
-		emb_dim: int embedding dimension
-		num_heads: int number of heads
-		num_layers: int number of layers
+		Args:
+			emb_dim: int embedding dimension
+			num_heads: int number of heads
+			num_layers: int number of layers
 	"""
 	def __init__(self, emb_dim, num_heads, num_layers):
 		super().__init__()
@@ -280,27 +311,69 @@ class Transformer(nn.Module):
 		)
 		
 	
+	def reset_cache(self):
+		for layer in self.transformer_layers:
+			layer.reset_cache()
+	
+	
 	"""
 	Transformer.forward
 		Runs a forward pass through the
 		transformer.
 	
-	Args:
-		x: torch.Tensor of size (B, N, D)
-		is_causal: boolean causal masking flag
+		Args:
+			x: torch.Tensor of size (B, N, D)
+			is_causal: boolean causal masking flag
 	"""
-	def forward(self, x, is_causal):
-		# run through layers
+	def forward(self, x, is_causal=True, use_cache=False):
+		layer_outputs = [x]
 		for layer in self.transformer_layers:
-			x = layer(x, is_causal)
-		return x
+			output = layer(layer_outputs, is_causal, use_cache)
+			layer_outputs.append(output)
+		return output
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization (Zhang & Sennrich, 2019)."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms_inv = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return self.scale * x * rms_inv
+
+
+class AttentionResidual(nn.Module):
+	def __init__(self, res_dim):
+		super().__init__()
+		# zero vector init
+		self.pseudo_query = nn.Parameter(torch.zeros(res_dim))
+		# RMSNorm on keys
+		self.key_norm = RMSNorm(res_dim)
+
+	def forward(self, *layer_tensors):
+		v = torch.stack(layer_tensors, dim=0)
+		k = self.key_norm(v)
+
+		# run attention on residuals
+		logits = torch.einsum('d, pbtd -> pbt', self.pseudo_query, k)
+		alphas = torch.softmax(logits, dim=0)
+		return torch.einsum('pbt, pbtd -> btd', alphas, v)
+
+
+
+# EXTRA STUFF
+
 
 
 class LoRALayer(torch.nn.Module):
 	def __init__(self, in_dim, out_dim, rank, alpha):
 		super().__init__()
 		std_dev = 1 / torch.sqrt(torch.tensor(rank).float())
-		self. = torch.nn.Parameter(torch.randn(in_dim, rank) * std_dev)
+		self.A = torch.nn.Parameter(torch.randn(in_dim, rank) * std_dev)
 		self.B = torch.nn.Parameter(torch.zeros(rank, out_dim))
 		self.alpha = alpha
 
@@ -317,3 +390,36 @@ class LinearLoRA(torch.nn.Module):
 
     def forward(self, x):
         return self.linear(x) + self.lora(x)
+
+
+"""
+add_lora
+    Replaces q_linear, k_linear, v_linear, and concat_linear in every
+    MultiheadAttention layer with LinearLoRA wrappers. Call this after
+    loading a pretrained checkpoint and before fine-tuning.
+
+	Args:
+		model: GPT instance with pretrained weights already loaded
+		rank:  int  LoRA rank (number of low-rank dimensions)
+		alpha: float LoRA scaling factor (convention: alpha = 2 * rank)
+"""
+def add_lora(model, rank=8, alpha=16, device=device):
+    for layer in model.transformer.transformer_layers:
+        attn = layer.attn_layer.to(device)
+        attn.q_linear      = LinearLoRA(attn.q_linear,      rank, alpha).to(device)
+        attn.k_linear      = LinearLoRA(attn.k_linear,      rank, alpha).to(device)
+        attn.v_linear      = LinearLoRA(attn.v_linear,      rank, alpha).to(device)
+        attn.concat_linear = LinearLoRA(attn.concat_linear, rank, alpha).to(device)
+
+
+"""
+freeze_base_model
+    Freezes every parameter except LoRA A/B matrices so that only the
+    low-rank adapters are updated during fine-tuning.
+
+	Args:
+		model: GPT instance with LoRA layers already injected via add_lora
+"""
+def freeze_base_model(model):
+    for name, param in model.named_parameters():
+        param.requires_grad = ".lora." in name or "classifier" in name or "token_embedding" in name
