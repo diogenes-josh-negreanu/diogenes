@@ -43,12 +43,12 @@ class RoPE(nn.Module):
 		Returns:
 			torch.Tensor of size (B, N, D)
 	"""
-	def forward(self, x):
+	def forward(self, x, start_pos=0):
 		seq_len = x.shape[1]
 
 		theta = 1.0 / (10000 ** (torch.arange(0, self.embed_dim, 2).float() / self.embed_dim)).to(x.device)
 
-		seq_idx = torch.arange(seq_len).float().to(x.device)
+		seq_idx = torch.arange(start_pos, start_pos + seq_len).float().to(x.device)
 
 		idx_theta = torch.einsum("i,j->ij", seq_idx, theta)
 		hat_theta = torch.cat([idx_theta, idx_theta], axis=-1)
